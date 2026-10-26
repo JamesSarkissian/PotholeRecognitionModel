@@ -1,0 +1,14 @@
+# Python
+__pycache__/
+*.pyc
+venv/
+.venv/
+
+# Data and trained models are too big for git
+data/
+Pothole/
+*.keras
+*.h5
+
+# macOS
+.DS_Store
