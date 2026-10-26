@@ -36,7 +36,8 @@ STAGE1_EPOCHS = 10      # an "epoch" = one full pass over every training image
 STAGE2_EPOCHS = 5       # extra passes for fine-tuning
 STAGE1_LR = 1e-3        # learning rate: how big each update step is
 STAGE2_LR = 1e-5        # much smaller for fine-tuning, so we don't wreck what it knows
-MODEL_PATH = "pothole_classifier.keras"
+# Save the model next to this script, where live.py looks for it
+MODEL_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "pothole_classifier.keras")
 
 
 # ---------------------------------------------------------------------------

@@ -11,6 +11,7 @@ of the loop grabs one frame, shrinks it to 224x224, asks the model "pothole?",
 and writes the answer on the frame before showing it.
 """
 
+import os
 import sys
 import time
 from collections import deque
@@ -19,7 +20,8 @@ import cv2
 import numpy as np
 import tensorflow as tf
 
-MODEL_PATH = "pothole_classifier.keras"
+# Look for the model next to this script, so it works from any folder
+MODEL_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "pothole_classifier.keras")
 IMAGE_SIZE = 224     # must match train.py
 THRESHOLD = 0.5      # score above this = pothole. Raise it for fewer false alarms
 SMOOTHING = 8        # average the last 8 scores so the label doesn't flicker
@@ -31,10 +33,17 @@ def main():
     source = sys.argv[1] if len(sys.argv) > 1 else "0"
     source = int(source) if source.isdigit() else source
 
+    if not os.path.exists(MODEL_PATH):
+        sys.exit(f"No trained model found at {MODEL_PATH}.\n"
+                 "Run 'python train.py' first to create it, then run live.py again.")
     model = tf.keras.models.load_model(MODEL_PATH)
+
     cap = cv2.VideoCapture(source)
     if not cap.isOpened():
-        sys.exit(f"Could not open video source: {source}")
+        if isinstance(source, int):
+            sys.exit("Could not open the camera. On a Mac, allow camera access for "
+                     "Terminal (or VS Code) in System Settings > Privacy & Security > Camera.")
+        sys.exit(f"Could not open video file: {source}")
 
     recent_scores = deque(maxlen=SMOOTHING)  # a list that keeps only the newest 8
     frame_count = 0
