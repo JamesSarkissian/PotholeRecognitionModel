@@ -12,3 +12,8 @@ Pothole/
 
 # macOS
 .DS_Store
+
+# YOLO training output and models
+runs/
+*.pt
+*_saved_model/

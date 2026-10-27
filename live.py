@@ -1,42 +1,79 @@
 """
-live.py - Scan live video for potholes using the model from train.py.
+live.py - Draw boxes around potholes in live video, using the model from train.py.
 
 How to run it:
     python live.py                  # use your webcam
     python live.py road_video.mp4   # use a recorded video instead
+    python live.py --conf 0.5       # only show boxes the model is 50%+ sure about
 Press q in the video window to quit.
 
 How it works: live video is just a fast loop over still pictures. Each pass
-of the loop grabs one frame, shrinks it to 224x224, asks the model "pothole?",
-and writes the answer on the frame before showing it.
+of the loop grabs one frame, asks the detector "where are the potholes?",
+and draws a box plus a confidence score around each one it finds.
 """
 
+import argparse
 import os
 import sys
 import time
-from collections import deque
 
 import cv2
-import numpy as np
-import tensorflow as tf
 
-# Look for the model next to this script, so it works from any folder
-MODEL_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "pothole_classifier.keras")
-IMAGE_SIZE = 224     # must match train.py
-THRESHOLD = 0.5      # score above this = pothole. Raise it for fewer false alarms
-SMOOTHING = 8        # average the last 8 scores so the label doesn't flicker
-EVERY_NTH_FRAME = 2  # only run the model on every 2nd frame to keep video smooth
+HERE = os.path.dirname(os.path.abspath(__file__))
+MODEL_PATH = os.path.join(HERE, "pothole_detector.pt")  # made by train.py
+IMAGE_SIZE = 640       # must match train.py
+CONFIDENCE = 0.35      # hide boxes the model is less sure about than this.
+                       # Raise it for fewer false alarms, lower it to catch more.
+BOX_COLOR = (0, 0, 255)  # red. OpenCV writes colors as (Blue, Green, Red)
+
+
+def pick_device():
+    """Use the Mac's graphics chip ("mps") if there is one, else the CPU."""
+    import torch
+    if torch.cuda.is_available():
+        return "0"
+    if torch.backends.mps.is_available():
+        return "mps"
+    return "cpu"
+
+
+def draw_boxes(frame, result):
+    """Draw each detected pothole's box and score on the frame. Returns the count."""
+    count = 0
+    # result.boxes holds every box the model found in this frame
+    for (x1, y1, x2, y2), score in zip(result.boxes.xyxy.tolist(), result.boxes.conf.tolist()):
+        x1, y1, x2, y2 = int(x1), int(y1), int(x2), int(y2)  # pixel corners
+        cv2.rectangle(frame, (x1, y1), (x2, y2), BOX_COLOR, 3)
+
+        # A filled label above the box, e.g. "pothole 87%"
+        label = f"pothole {score:.0%}"
+        (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)
+        top = max(y1, th + 10)  # keep the label on screen if the box touches the top
+        cv2.rectangle(frame, (x1, top - th - 10), (x1 + tw + 8, top), BOX_COLOR, -1)
+        cv2.putText(frame, label, (x1 + 4, top - 6),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+        count += 1
+    return count
 
 
 def main():
-    # A number means a camera (0 = built-in webcam); anything else is a file path
-    source = sys.argv[1] if len(sys.argv) > 1 else "0"
-    source = int(source) if source.isdigit() else source
+    parser = argparse.ArgumentParser(description="Draw boxes around potholes in live video.")
+    parser.add_argument("source", nargs="?", default="0",
+                        help="camera number (0 = built-in webcam) or a video file path")
+    parser.add_argument("--conf", type=float, default=CONFIDENCE,
+                        help=f"minimum confidence to show a box (default {CONFIDENCE})")
+    args = parser.parse_args()
+
+    # A number means a camera; anything else is a file path
+    source = int(args.source) if args.source.isdigit() else args.source
 
     if not os.path.exists(MODEL_PATH):
         sys.exit(f"No trained model found at {MODEL_PATH}.\n"
                  "Run 'python train.py' first to create it, then run live.py again.")
-    model = tf.keras.models.load_model(MODEL_PATH)
+
+    from ultralytics import YOLO
+    model = YOLO(MODEL_PATH)
+    device = pick_device()
 
     cap = cv2.VideoCapture(source)
     if not cap.isOpened():
@@ -45,40 +82,30 @@ def main():
                      "Terminal (or VS Code) in System Settings > Privacy & Security > Camera.")
         sys.exit(f"Could not open video file: {source}")
 
-    recent_scores = deque(maxlen=SMOOTHING)  # a list that keeps only the newest 8
-    frame_count = 0
     last_time = time.time()
-
     while True:
         ok, frame = cap.read()
         if not ok:
             break  # video ended or camera disconnected
 
-        if frame_count % EVERY_NTH_FRAME == 0:
-            # OpenCV stores colors as BGR; the model was trained on RGB
-            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            small = cv2.resize(rgb, (IMAGE_SIZE, IMAGE_SIZE))
-            # The model expects a batch, so add a batch dimension: (1, 224, 224, 3)
-            batch = np.expand_dims(small, axis=0).astype("float32")
-            # Calling the model directly is faster than model.predict for one image
-            score = float(model(batch, training=False)[0][0])
-            recent_scores.append(score)
-        frame_count += 1
-
-        avg = sum(recent_scores) / len(recent_scores)
-        if avg > THRESHOLD:
-            label, color = f"POTHOLE {avg:.0%}", (0, 0, 255)  # red (BGR order)
-        else:
-            label, color = f"clear road {1 - avg:.0%}", (0, 200, 0)  # green
+        # Ask the model where the potholes are. YOLO handles resizing and
+        # color order itself, so we can hand it the raw OpenCV frame.
+        # verbose=False stops it printing a line for every single frame.
+        result = model.predict(frame, imgsz=IMAGE_SIZE, conf=args.conf,
+                               device=device, verbose=False)[0]
+        count = draw_boxes(frame, result)
 
         # Frames per second, so you can see how fast it runs on your machine
         now = time.time()
         fps = 1.0 / max(now - last_time, 1e-6)
         last_time = now
 
-        cv2.putText(frame, label, (20, 50), cv2.FONT_HERSHEY_SIMPLEX, 1.4, color, 3)
-        cv2.putText(frame, f"{fps:.0f} fps", (20, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
-        cv2.imshow("Pothole scanner (press q to quit)", frame)
+        status = f"{count} pothole{'s' if count != 1 else ''}" if count else "clear road"
+        cv2.putText(frame, status, (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 1.0,
+                    BOX_COLOR if count else (0, 200, 0), 2)
+        cv2.putText(frame, f"{fps:.0f} fps", (20, 75), cv2.FONT_HERSHEY_SIMPLEX, 0.7,
+                    (255, 255, 255), 2)
+        cv2.imshow("Pothole detector (press q to quit)", frame)
 
         if cv2.waitKey(1) & 0xFF == ord("q"):
             break
