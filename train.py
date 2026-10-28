@@ -1,206 +1,231 @@
 """
-train.py - Teach a neural network to tell "pothole" from "clear road".
+train.py - Teach a model to DRAW A BOX around every pothole in a picture.
 
 How to run it:
-    python train.py                         # uses ~/Downloads/Pothole
-    python train.py --data /path/to/Pothole --epochs 10
+    python train.py                          # uses ~/Downloads/Pothole
+    python train.py --data /path/to/Pothole  # or point it somewhere else
+    python train.py --epochs 20              # shorter run, just to try it out
+
+The old version of this project only answered "is there a pothole somewhere
+in this picture, yes or no?". This version is an OBJECT DETECTOR: for every
+pothole it finds, it gives back a box (x1, y1, x2, y2) and a confidence score.
+
+Which detector? We use YOLO ("You Only Look Once") from the Ultralytics
+package. YOLO is the most popular real-time detector: it's accurate, fast
+enough for live webcam video on a laptop, and training it is one function
+call. The TensorFlow Object Detection API can do the same job, but it is
+old, hard to install on a Mac, and full of config files. YOLO can still be
+exported to TensorFlow at the end (see --export-tf below).
 
 What this script does, step by step:
-    1. Reads the three _annotations.csv files (train / valid / test) and turns
-       every image into a simple yes/no label: 1 = has a pothole, 0 = clear road.
-    2. Builds a model using TRANSFER LEARNING: we borrow MobileNetV2, a network
-       Google already trained on 1.4 million everyday photos, and only teach a
-       small new "head" on top of it to answer our one question.
-    3. Trains in two stages:
-         Stage 1 - the borrowed network is frozen, only the new head learns.
-         Stage 2 - "fine-tuning": we unfreeze the top of the borrowed network
-                   and let it adjust slightly to road photos.
-    4. Tests the finished model on the test images it has never seen and
-       prints how well it did.
-    5. Saves the model to pothole_classifier.keras so live.py can use it.
+    1. CONVERT the data. Your Roboflow export lists boxes in CSV files as
+       pixel corners (xmin, ymin, xmax, ymax). YOLO wants one small .txt file
+       per image with each box as (center x, center y, width, height), all
+       written as fractions of the image size. We write those files into
+       data/pothole_yolo/ inside this project folder. Your original
+       ~/Downloads/Pothole folder is never changed.
+    2. TRAIN. We start from "yolo11n.pt", a small YOLO model already trained
+       on 118,000 everyday photos (people, cars, dogs...). It already knows
+       how to find objects in general; we only teach it what a pothole looks
+       like. This is called transfer learning, like the old MobileNetV2 model.
+    3. TEST the finished model on the test images it never saw, and print
+       how accurate its boxes are.
+    4. SAVE the best model as pothole_detector.pt next to this script, where
+       live.py looks for it.
 """
 
 import argparse
 import csv
 import os
-
-import tensorflow as tf
-
-# ---------------------------------------------------------------------------
-# Settings. These are the "knobs" you can turn. Change them and re-run to see
-# what happens - that's the best way to learn what each one does.
-# ---------------------------------------------------------------------------
-IMAGE_SIZE = 224        # MobileNetV2 was trained on 224x224 images, so we match it
-BATCH_SIZE = 32         # how many images the model looks at before each update
-STAGE1_EPOCHS = 10      # an "epoch" = one full pass over every training image
-STAGE2_EPOCHS = 5       # extra passes for fine-tuning
-STAGE1_LR = 1e-3        # learning rate: how big each update step is
-STAGE2_LR = 1e-5        # much smaller for fine-tuning, so we don't wreck what it knows
-# Save the model next to this script, where live.py looks for it
-MODEL_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "pothole_classifier.keras")
-
+import shutil
+import sys
 
 # ---------------------------------------------------------------------------
-# Step 1: load the data
+# Settings. These are the "knobs" you can turn.
 # ---------------------------------------------------------------------------
-def load_split(data_dir, split):
-    """Read one split's CSV and return (list of image paths, list of 0/1 labels).
+BASE_MODEL = "yolo11n.pt"  # n = nano, the smallest/fastest. Try "yolo11s.pt" for
+                           # a bigger model: more accurate but ~3x slower.
+IMAGE_SIZE = 640           # images are resized to 640x640 for the model
+EPOCHS = 60                # one epoch = one full pass over every training image
+PATIENCE = 15              # stop early if 15 epochs in a row don't improve
+BATCH_SIZE = 16            # images per update. Lower to 8 if you run out of memory
 
-    The CSV has one row per pothole BOX, so an image with 3 potholes appears on
-    3 rows. Clear-road images appear on one row with the class column blank.
-    For a yes/no classifier we only care whether an image has ANY pothole.
+HERE = os.path.dirname(os.path.abspath(__file__))  # this project's folder
+YOLO_DATA_DIR = os.path.join(HERE, "data", "pothole_yolo")
+MODEL_PATH = os.path.join(HERE, "pothole_detector.pt")
+
+# Roboflow calls the validation folder "valid"; YOLO calls it "val"
+SPLITS = {"train": "train", "valid": "val", "test": "test"}
+
+
+# ---------------------------------------------------------------------------
+# Step 1: convert the Roboflow CSV boxes into YOLO's format
+# ---------------------------------------------------------------------------
+def convert_split(data_dir, roboflow_split, yolo_split):
+    """Copy one split's images and write a YOLO label file for each one.
+
+    The CSV has one row per BOX, so an image with 3 potholes is on 3 rows.
+    Clear-road images (the 300 extra ones) are on one row with the class and
+    box columns left blank: they get an EMPTY label file, which tells YOLO
+    "there is nothing to find here". Those empty examples teach the model not
+    to draw boxes on manholes, speed bumps and normal road.
     """
-    split_dir = os.path.join(data_dir, split)
-    has_pothole = {}  # filename -> True / False
+    src_dir = os.path.join(data_dir, roboflow_split)
+    img_out = os.path.join(YOLO_DATA_DIR, "images", yolo_split)
+    lbl_out = os.path.join(YOLO_DATA_DIR, "labels", yolo_split)
+    os.makedirs(img_out, exist_ok=True)
+    os.makedirs(lbl_out, exist_ok=True)
 
-    with open(os.path.join(split_dir, "_annotations.csv"), newline="") as f:
+    boxes = {}  # filename -> list of YOLO label lines
+    with open(os.path.join(src_dir, "_annotations.csv"), newline="") as f:
         for row in csv.DictReader(f):
             name = row["filename"]
-            is_pothole = row["class"] == "pothole"
-            # "or" means: once an image is marked as having a pothole, it stays marked
-            has_pothole[name] = has_pothole.get(name, False) or is_pothole
+            boxes.setdefault(name, [])  # make sure clear-road images get an entry
+            if row["class"] != "pothole":
+                continue  # blank row = clear-road image, no box to add
 
-    paths = [os.path.join(split_dir, name) for name in has_pothole]
-    labels = [1 if has_pothole[name] else 0 for name in has_pothole]
-    return paths, labels
+            w, h = float(row["width"]), float(row["height"])
+            # Keep the corners inside the picture, just in case
+            x1 = min(max(float(row["xmin"]), 0), w)
+            y1 = min(max(float(row["ymin"]), 0), h)
+            x2 = min(max(float(row["xmax"]), 0), w)
+            y2 = min(max(float(row["ymax"]), 0), h)
+            if x2 <= x1 or y2 <= y1:
+                continue  # skip broken boxes with no area
 
+            # Corners in pixels -> center + size as fractions (0 to 1)
+            cx = (x1 + x2) / 2 / w
+            cy = (y1 + y2) / 2 / h
+            bw = (x2 - x1) / w
+            bh = (y2 - y1) / h
+            # The leading 0 is the class number: 0 = pothole (our only class)
+            boxes[name].append(f"0 {cx:.6f} {cy:.6f} {bw:.6f} {bh:.6f}")
 
-def load_image(path, label):
-    """Turn a file path into a 224x224 image tensor (a grid of pixel numbers)."""
-    data = tf.io.read_file(path)
-    image = tf.io.decode_jpeg(data, channels=3)              # RGB pixels, 0-255
-    image = tf.image.resize(image, (IMAGE_SIZE, IMAGE_SIZE))  # squash to 224x224
-    return image, label
+    for name, lines in boxes.items():
+        shutil.copy2(os.path.join(src_dir, name), os.path.join(img_out, name))
+        label_name = os.path.splitext(name)[0] + ".txt"
+        with open(os.path.join(lbl_out, label_name), "w") as f:
+            f.write("\n".join(lines))
 
-
-def make_dataset(paths, labels, shuffle):
-    """Wrap the file list in a tf.data pipeline that loads images in batches."""
-    ds = tf.data.Dataset.from_tensor_slices((paths, labels))
-    if shuffle:
-        # Shuffling stops the model from learning the ORDER of the images
-        ds = ds.shuffle(len(paths), seed=42)
-    ds = ds.map(load_image, num_parallel_calls=tf.data.AUTOTUNE)
-    # prefetch loads the next batch while the current one is training
-    return ds.batch(BATCH_SIZE).prefetch(tf.data.AUTOTUNE)
-
-
-# ---------------------------------------------------------------------------
-# Step 2: build the model
-# ---------------------------------------------------------------------------
-def build_model():
-    # Data augmentation: random small changes to each training image so the
-    # model sees "new" pictures every epoch and doesn't just memorize them.
-    # These layers only do anything during training; they switch off later.
-    augment = tf.keras.Sequential([
-        tf.keras.layers.RandomFlip("horizontal"),
-        tf.keras.layers.RandomRotation(0.05),
-        tf.keras.layers.RandomZoom(0.15),
-        tf.keras.layers.RandomContrast(0.2),
-    ], name="augmentation")
-
-    # The borrowed network. include_top=False drops its original final layer,
-    # which picked between 1,000 ImageNet categories (cats, cars, ...).
-    base = tf.keras.applications.MobileNetV2(
-        input_shape=(IMAGE_SIZE, IMAGE_SIZE, 3),
-        include_top=False,
-        weights="imagenet",
-    )
-    base.trainable = False  # freeze it for stage 1
-
-    inputs = tf.keras.Input(shape=(IMAGE_SIZE, IMAGE_SIZE, 3))
-    x = augment(inputs)
-    # MobileNetV2 expects pixels scaled from -1 to 1 instead of 0 to 255
-    x = tf.keras.applications.mobilenet_v2.preprocess_input(x)
-    x = base(x, training=False)
-    # The base outputs a 7x7 grid of 1,280 "features". Averaging the grid turns
-    # it into one list of 1,280 numbers describing the whole image.
-    x = tf.keras.layers.GlobalAveragePooling2D()(x)
-    # Dropout randomly ignores 30% of those numbers during training, which
-    # makes the model rely on many clues instead of one (less overfitting).
-    x = tf.keras.layers.Dropout(0.3)(x)
-    # One output neuron. Sigmoid squeezes it to 0..1 = "probability of pothole".
-    outputs = tf.keras.layers.Dense(1, activation="sigmoid")(x)
-
-    return tf.keras.Model(inputs, outputs), base
+    n_boxes = sum(len(lines) for lines in boxes.values())
+    n_empty = sum(1 for lines in boxes.values() if not lines)
+    print(f"  {yolo_split:5s}: {len(boxes)} images, {n_boxes} pothole boxes, "
+          f"{n_empty} clear-road images")
 
 
-def compile_model(model, learning_rate):
-    model.compile(
-        optimizer=tf.keras.optimizers.Adam(learning_rate),
-        # binary_crossentropy = the standard "how wrong was I" score for yes/no
-        loss="binary_crossentropy",
-        metrics=[
-            "accuracy",
-            # precision: when it says "pothole", how often is it right?
-            tf.keras.metrics.Precision(name="precision"),
-            # recall: of all real potholes, how many did it catch?
-            tf.keras.metrics.Recall(name="recall"),
-        ],
-    )
+def prepare_data(data_dir):
+    """Build data/pothole_yolo/ and the data.yaml file that tells YOLO where it is."""
+    for split in SPLITS:
+        if not os.path.exists(os.path.join(data_dir, split, "_annotations.csv")):
+            sys.exit(f"Could not find {split}/_annotations.csv inside {data_dir}.\n"
+                     "Use --data to point at your Pothole folder.")
+
+    # Start fresh each time so old files never sneak in
+    if os.path.exists(YOLO_DATA_DIR):
+        shutil.rmtree(YOLO_DATA_DIR)
+
+    print(f"Converting {data_dir} to YOLO format...")
+    for roboflow_split, yolo_split in SPLITS.items():
+        convert_split(data_dir, roboflow_split, yolo_split)
+
+    # data.yaml is a tiny settings file: where the images are, and class names.
+    # YOLO finds each image's label by swapping "images" for "labels" in the path.
+    yaml_path = os.path.join(YOLO_DATA_DIR, "data.yaml")
+    with open(yaml_path, "w") as f:
+        f.write(f"path: {YOLO_DATA_DIR}\n"
+                "train: images/train\n"
+                "val: images/val\n"
+                "test: images/test\n"
+                "names:\n"
+                "  0: pothole\n")
+    return yaml_path
 
 
 # ---------------------------------------------------------------------------
-# Steps 3-5: train, test, save
+# Pick the fastest hardware available
 # ---------------------------------------------------------------------------
+def pick_device():
+    """Use the Mac's graphics chip ("mps") if there is one, else the CPU."""
+    import torch
+    if torch.cuda.is_available():
+        return "0"    # an NVIDIA GPU (e.g. Google Colab)
+    if torch.backends.mps.is_available():
+        return "mps"  # Apple Silicon Macs (M1, M2, M3...)
+    return "cpu"
+
+
 def main():
-    parser = argparse.ArgumentParser(description="Train the pothole classifier.")
+    parser = argparse.ArgumentParser(description="Train the pothole box detector.")
     parser.add_argument("--data", default=os.path.expanduser("~/Downloads/Pothole"),
-                        help="folder that holds train/, valid/ and test/")
-    parser.add_argument("--epochs", type=int, default=STAGE1_EPOCHS,
-                        help="stage 1 epochs (stage 2 adds %d more)" % STAGE2_EPOCHS)
+                        help="folder with train/, valid/ and test/ (default: ~/Downloads/Pothole)")
+    parser.add_argument("--epochs", type=int, default=EPOCHS)
+    parser.add_argument("--model", default=BASE_MODEL,
+                        help="starting model: yolo11n.pt (fast) or yolo11s.pt (more accurate)")
+    parser.add_argument("--device", default=None,
+                        help="mps, cpu, or 0 for an NVIDIA GPU (default: pick automatically)")
+    parser.add_argument("--batch", type=int, default=BATCH_SIZE)
+    parser.add_argument("--export-tf", action="store_true",
+                        help="also save a TensorFlow SavedModel copy (slow, optional)")
     args = parser.parse_args()
 
-    train_paths, train_labels = load_split(args.data, "train")
-    val_paths, val_labels = load_split(args.data, "valid")
-    test_paths, test_labels = load_split(args.data, "test")
-    for name, labels in [("train", train_labels), ("valid", val_labels), ("test", test_labels)]:
-        print(f"{name}: {len(labels)} images, {sum(labels)} pothole, "
-              f"{len(labels) - sum(labels)} clear road")
+    yaml_path = prepare_data(os.path.expanduser(args.data))
 
-    train_ds = make_dataset(train_paths, train_labels, shuffle=True)
-    val_ds = make_dataset(val_paths, val_labels, shuffle=False)
-    test_ds = make_dataset(test_paths, test_labels, shuffle=False)
+    # Imported here so the data step above works even before ultralytics is set up
+    from ultralytics import YOLO
 
-    # There are about twice as many pothole images as clear-road ones. Class
-    # weights make each clear-road mistake count more, so the model can't win
-    # by simply guessing "pothole" every time.
-    n_pos = sum(train_labels)
-    n_neg = len(train_labels) - n_pos
-    class_weight = {0: len(train_labels) / (2 * n_neg), 1: len(train_labels) / (2 * n_pos)}
+    device = args.device or pick_device()
+    print(f"\nTraining on: {device}  (mps = your Mac's graphics chip)\n")
 
-    model, base = build_model()
-    model.summary()
+    # Step 2: train. The first run downloads yolo11n.pt (about 5 MB).
+    model = YOLO(args.model)
+    model.train(
+        data=yaml_path,
+        epochs=args.epochs,
+        patience=PATIENCE,
+        imgsz=IMAGE_SIZE,
+        batch=args.batch,
+        device=device,
+        project=os.path.join(HERE, "runs"),  # charts and checkpoints go here
+        name="pothole",
+        exist_ok=True,   # overwrite the previous run instead of making pothole2, 3...
+        # Augmentation: YOLO randomly flips, recolors, scales and stitches
+        # images together while training, so 675 photos feel like many more.
+        # The defaults are good; fliplr=0.5 means "mirror half the images".
+        fliplr=0.5,
+        plots=True,      # saves charts like results.png in runs/pothole/
+    )
 
-    # Save the best version seen so far (judged on validation data), and stop
-    # early if validation stops improving for 3 epochs in a row.
-    callbacks = [
-        tf.keras.callbacks.ModelCheckpoint(MODEL_PATH, monitor="val_loss", save_best_only=True),
-        tf.keras.callbacks.EarlyStopping(monitor="val_loss", patience=3, restore_best_weights=True),
-    ]
+    # YOLO keeps the checkpoint that scored best on the validation images
+    best = os.path.join(HERE, "runs", "pothole", "weights", "best.pt")
+    shutil.copy2(best, MODEL_PATH)
 
-    print("\n=== Stage 1: training the new head ===")
-    compile_model(model, STAGE1_LR)
-    model.fit(train_ds, validation_data=val_ds, epochs=args.epochs,
-              class_weight=class_weight, callbacks=callbacks)
+    # Step 3: test on images the model has never seen
+    print("\nTesting on the test images...")
+    model = YOLO(MODEL_PATH)
+    metrics = model.val(data=yaml_path, split="test", imgsz=IMAGE_SIZE, device=device,
+                        project=os.path.join(HERE, "runs"), name="pothole_test",
+                        exist_ok=True)
 
-    print("\n=== Stage 2: fine-tuning the top of MobileNetV2 ===")
-    base.trainable = True
-    # Keep the first 100 layers frozen. Early layers detect basic edges and
-    # colors, which are useful as-is; later layers detect more specific shapes.
-    for layer in base.layers[:100]:
-        layer.trainable = False
-    compile_model(model, STAGE2_LR)  # must re-compile after changing trainable
-    model.fit(train_ds, validation_data=val_ds, epochs=STAGE2_EPOCHS,
-              class_weight=class_weight, callbacks=callbacks)
+    # What these numbers mean:
+    #   precision - of the boxes it drew, how many really were potholes
+    #   recall    - of the real potholes, how many it found
+    #   mAP50     - overall score: a box counts as right if it overlaps the
+    #               true box by at least 50%. Higher is better, 1.0 is perfect.
+    print("\n========== Test results ==========")
+    print(f"Precision: {metrics.box.mp:.1%}")
+    print(f"Recall:    {metrics.box.mr:.1%}")
+    print(f"mAP50:     {metrics.box.map50:.1%}")
+    print("==================================")
+    print(f"Saved the model to {MODEL_PATH}")
+    print("Charts and example predictions are in runs/pothole/ and runs/pothole_test/")
 
-    print("\n=== Final test on images the model has never seen ===")
-    loss, acc, precision, recall = model.evaluate(test_ds)
-    print(f"accuracy:  {acc:.1%}")
-    print(f"precision: {precision:.1%}  (when it says pothole, it's right this often)")
-    print(f"recall:    {recall:.1%}  (share of real potholes it caught)")
+    # Step 4 (optional): a TensorFlow copy, for phones (TFLite) or TF-only apps.
+    # live.py doesn't need this.
+    if args.export_tf:
+        print("\nExporting a TensorFlow SavedModel (this can take a few minutes)...")
+        model.export(format="saved_model", imgsz=IMAGE_SIZE)
 
-    model.save(MODEL_PATH)
-    print(f"\nSaved model to {MODEL_PATH}. Try it live with: python live.py")
+    print("\nNext: run 'python live.py' to see boxes on your webcam.")
 
 
 if __name__ == "__main__":
